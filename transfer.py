@@ -1,13 +1,13 @@
 """Drag-and-drop LAN file transfer. Run on every machine: python transfer.py
-Open http://<other-machine-ip>:8000 in a browser, drop files, they land in its ~/Downloads/Transfer.
+Open http://<other-machine-ip>:8000 in a browser, drop files, they land in its ~/Downloads/Transfer Files.
 Stdlib only, works on Windows and macOS."""
 import json, os, socket, sys, urllib.parse, webbrowser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
-SHARE = Path.home() / "Downloads" / "Transfer"
-SHARE.mkdir(parents=True, exist_ok=True)
+# not "Transfer": the downloaded app itself is usually ~/Downloads/Transfer
+SHARE = Path.home() / "Downloads" / "Transfer Files"
 CHUNK = 1 << 20
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -129,10 +129,17 @@ def lan_ip():
 
 
 if __name__ == "__main__":
-    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    try:
+        SHARE.mkdir(parents=True, exist_ok=True)
+        srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    except OSError as e:
+        # keep the window open so a double-clicked app shows why it failed
+        print(f"Could not start: {e}\n(Already running in another window? Close it first.)", flush=True)
+        input("Press Enter to close.")
+        sys.exit(1)
     url = f"http://{lan_ip()}:{PORT}"
     print(f"Transfer running.\n  This machine:  {url}\n  Saving to:     {SHARE}\n"
-          f"Open the OTHER machine's address in your browser to send files to it. Ctrl+C to stop.")
+          f"Open the OTHER machine's address in your browser to send files to it. Ctrl+C to stop.", flush=True)
     webbrowser.open(f"http://localhost:{PORT}")
     try:
         srv.serve_forever()
