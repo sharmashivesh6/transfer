@@ -29,7 +29,7 @@ PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport
 <title>Transfer</title><style>
 :root{--bg:#eef1f6;--card:rgba(255,255,255,.74);--solid:#fff;--line:rgba(16,24,40,.08);--text:#0f1320;--dim:#667085;--acc:#3b6cff;--acc2:#8b5cf6;--accbg:rgba(59,108,255,.09);--ok:#12b76a;--bad:#f04438;--rim:rgba(255,255,255,.75);--shadow:0 1px 2px rgba(16,24,40,.04),0 12px 32px -10px rgba(16,24,40,.14)}
 @media (prefers-color-scheme:dark){:root{--bg:#090b11;--card:rgba(22,26,36,.72);--solid:#161a24;--line:rgba(255,255,255,.07);--text:#eef1f7;--dim:#8b93a7;--acc:#6b8cff;--acc2:#a78bfa;--accbg:rgba(107,140,255,.13);--rim:rgba(255,255,255,.06);--shadow:0 12px 32px -10px rgba(0,0,0,.6)}}
-*{box-sizing:border-box}html,body{margin:0;min-height:100%}
+*{box-sizing:border-box}html,body{margin:0;min-height:100%}[hidden]{display:none!important}
 body{font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--text);-webkit-user-select:none;user-select:none;cursor:default;overflow-x:hidden}
 .bgfx{position:fixed;inset:-20%;z-index:-1;pointer-events:none;background:radial-gradient(40% 35% at 20% 20%,rgba(59,108,255,.16),transparent 70%),radial-gradient(35% 30% at 80% 30%,rgba(139,92,246,.14),transparent 70%),radial-gradient(40% 35% at 60% 90%,rgba(56,189,248,.12),transparent 70%);animation:drift 24s ease-in-out infinite alternate}
 @keyframes drift{to{transform:translate(4%,-3%) rotate(6deg) scale(1.05)}}
@@ -383,7 +383,8 @@ $("#ubtn").onclick=async()=>{const b=$("#ubtn");if(b.dataset.manual)return api("
 let busy=false;
 async function poll(){try{const s=await(await api("/api/state")).json();
   myName=s.name;$("#me").textContent=`${s.name} · ${s.ip}`;$("#ver").textContent=s.version=="dev"?"":s.version;
-  if(s.update&&$("#update").hidden){$("#update").hidden=false;$("#utitle").textContent=`Transfer ${s.update} is available`}
+  if(s.update)$("#utitle").textContent=`Transfer ${s.update} is available`;
+  if(!$("#ubtn").disabled)$("#update").hidden=!s.update;  // stays up while updating
   drawOffers(s.offers);trackBatches(s.batches);busy=s.offers.length>0||s.batches.some(b=>!b.done&&!b.failed);
   const k=JSON.stringify(s.peers);if(k!==peerKey){peerKey=k;peers=s.peers;if(document.activeElement?.id!="ip"||peers.length)drawPeers()}
   drawFiles(s.files);const names=s.files.map(f=>f.name);
