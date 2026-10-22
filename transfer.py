@@ -14,6 +14,7 @@ CHUNK = 1 << 20
 ME = uuid.uuid4().hex
 NAME = socket.gethostname().removesuffix(".local")
 peers = {}  # id -> {"name", "ip", "port", "seen"}
+incoming = {}  # upload key -> {"name", "from", "size", "got"}, while a file is arriving
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Transfer</title><style>
@@ -48,6 +49,7 @@ button,.link{font:inherit;border:0;background:none;color:var(--acc);cursor:point
 <div><h1>Transfer</h1><div class="dim" id="me">Starting…</div></div></header>
 <h2>Send to</h2><div id="peers"></div>
 <div id="sendwrap" hidden><h2>Sending</h2><div class="list" id="sending"></div></div>
+<div id="recvwrap" hidden><h2>Receiving</h2><div class="list" id="receiving"></div></div>
 <h2>Received <button id="folder">Show folder</button></h2><div class="list files" id="files"></div>
 <input id="pick" type="file" multiple hidden><div id="toast"></div>
 <script>
@@ -88,14 +90,21 @@ function drawFiles(files){const el=$("#files");
   for(const f of files){const r=document.createElement("div");r.className="row";r.title="Show in folder";
     r.innerHTML=`<span class="name"></span><span class="meta">${fmt(f.size)} · ${new Date(f.time*1000).toLocaleString([],{dateStyle:"short",timeStyle:"short"})}</span>`;
     r.querySelector(".name").textContent=f.name;r.onclick=()=>api("/api/reveal?name="+encodeURIComponent(f.name),{method:"POST"});el.append(r)}}
+function drawIncoming(list){$("#recvwrap").hidden=!list.length;const el=$("#receiving");el.innerHTML="";
+  for(const f of list){const r=document.createElement("div");r.className="row";
+    r.innerHTML=`<span class="name"></span><span class="meta">from ${esc(f.from)} · ${fmt(f.got)} of ${fmt(f.size)}</span><span class="bar"><i style="width:${f.size?f.got/f.size*100:0}%"></i></span>`;
+    r.querySelector(".name").textContent=f.name;el.append(r)}}
 $("#folder").onclick=()=>api("/api/reveal",{method:"POST"});
+let busy=false;
 async function poll(){try{const s=await(await api("/api/state")).json();
+  drawIncoming(s.incoming);busy=s.incoming.length>0;
   $("#me").textContent=`This computer: ${s.name} · ${s.ip}`;
   const k=JSON.stringify(s.peers);if(k!==peerKey){peerKey=k;peers=s.peers;if(!document.activeElement||document.activeElement.id!="ip"||peers.length)drawPeers()}
   const names=s.files.map(f=>f.name);
   if(known)for(const n of names)if(!known.has(n))toast("Received "+n);
-  known=new Set(names);drawFiles(s.files)}catch(e){}}
-poll();setInterval(poll,1500);
+  known=new Set(names);drawFiles(s.files)}catch(e){}
+  setTimeout(poll,busy?400:1500)}  // refresh faster while a file is arriving
+poll();
 </script></body></html>"""
 
 
@@ -196,7 +205,8 @@ class Handler(BaseHTTPRequestHandler):
                      for p in sorted(SHARE.iterdir(), key=lambda p: -p.stat().st_mtime)
                      if p.is_file() and not p.name.startswith(".")]
             live = [{"id": k, "name": v["name"], "ip": v["ip"]} for k, v in list(peers.items()) if now - v["seen"] < 7]
-            state = {"name": NAME, "ip": lan_ip(), "peers": sorted(live, key=lambda p: p["name"].lower()), "files": files}
+            state = {"name": NAME, "ip": lan_ip(), "peers": sorted(live, key=lambda p: p["name"].lower()),
+                     "files": files, "incoming": list(incoming.values())}
             return self.reply(200, json.dumps(state), "application/json")
         self.reply(404)
 
@@ -234,6 +244,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             conn.putrequest("PUT", "/upload/" + urllib.parse.quote(name))
             conn.putheader("Content-Length", str(left))
+            conn.putheader("X-From", urllib.parse.quote(NAME))
             conn.endheaders()
             while left:
                 buf = self.rfile.read(min(CHUNK, left))
@@ -255,7 +266,10 @@ class Handler(BaseHTTPRequestHandler):
         if not name:
             return self.reply(400, "bad filename")
         left = int(self.headers.get("Content-Length", 0))
-        tmp = SHARE / f".{name}.part"
+        sender = urllib.parse.unquote(self.headers.get("X-From", ""))[:64] or self.client_address[0]
+        key = uuid.uuid4().hex
+        incoming[key] = info = {"name": name, "from": sender, "size": left, "got": 0}
+        tmp = SHARE / f".{key}.part"
         try:
             with open(tmp, "wb") as f:
                 while left:
@@ -264,10 +278,13 @@ class Handler(BaseHTTPRequestHandler):
                         raise ConnectionError("sender disconnected")
                     f.write(buf)
                     left -= len(buf)
+                    info["got"] += len(buf)
             tmp.rename(unique(SHARE / name))
         except Exception:
             tmp.unlink(missing_ok=True)
             raise
+        finally:
+            incoming.pop(key, None)
         self.reply(200, "ok")
 
     def log_message(self, *args):
