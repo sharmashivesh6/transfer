@@ -2,7 +2,7 @@
 Open the app on each computer; they find each other automatically. Drop files on a computer to send;
 the other side clicks Accept. Received files go to ~/Downloads/Transfer Files.
 Runs in its own window when pywebview is installed (the built apps), else in the default browser."""
-import http.client, ipaddress, json, os, socket, subprocess, sys, threading, time, urllib.parse, uuid, webbrowser
+import http.client, ipaddress, json, os, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.parse, uuid, webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -19,6 +19,11 @@ offers = {}  # offer id -> {"from", "files", "event", "ok", "t"}, waiting for Ac
 allowed = {}  # token -> {"from", "files": [[name, size], ...], "batch"}: accepted files not yet received
 batches = {}  # batch id -> progress of an accepted set of incoming files, for the receiving window
 ASK_SECS = 120  # how long a send request waits for an answer
+VERSION = "dev"  # the release build replaces this with the git tag, e.g. "v1.1"
+REPO = "https://github.com/sharmashivesh6/transfer"
+FROZEN = getattr(sys, "frozen", False)  # running as the built app, so it can update itself
+NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # no console flash for curl on Windows
+latest = None  # newer release tag, once found
 
 PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Transfer</title><style>
@@ -84,6 +89,15 @@ body.dragging #dropHint{transform:translate(-50%,0)}
 .btn{padding:10px 18px;border-radius:12px;font-weight:650;background:var(--accbg)}
 .btn.primary{background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;box-shadow:0 8px 20px -6px rgba(91,108,255,.75)}
 .btn.primary:hover{filter:brightness(1.1);background:linear-gradient(135deg,var(--acc),var(--acc2))}
+
+/* update banner */
+.ver{font-size:11px;font-weight:650;color:var(--dim);background:var(--accbg);padding:2px 7px;border-radius:99px;vertical-align:middle;letter-spacing:0}.ver:empty{display:none}
+.update{margin-top:20px;border-radius:18px;padding:14px 16px;display:flex;gap:14px;align-items:center;animation:in .5s cubic-bezier(.2,.8,.2,1)}
+.update .uic{width:40px;height:40px;border-radius:12px;flex:none;display:grid;place-items:center;background:linear-gradient(135deg,#12b76a,#38bdf8);box-shadow:0 8px 20px -6px rgba(18,183,106,.7);animation:nudge 2s ease-in-out infinite}
+@keyframes nudge{50%{transform:translateY(-3px)}}
+.update .txt{flex:1;min-width:0}.update .txt b{display:block;font-size:15px}.update .dim{color:var(--dim);font-size:12.5px}
+.update .btn:disabled{opacity:.85;cursor:default}
+.uspin{display:inline-block;width:12px;height:12px;margin-right:8px;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%;vertical-align:-1px;animation:spin .8s linear infinite}
 
 /* transfer stage */
 .stage{position:relative;margin-top:22px;border-radius:26px;height:0;opacity:0;overflow:hidden;color:#eef2ff;
@@ -153,7 +167,9 @@ body.dragging #dropHint{transform:translate(-50%,0)}
 <div class="bgfx"></div><div id="dropHint">Drop onto a computer to send</div>
 <main>
 <header><div class="logo"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4v13M3 13l4 4 4-4M17 20V7M13 11l4-4 4 4"/></svg></div>
-<div><h1>Transfer</h1><div class="chip"><span class="live"></span><span id="me">Starting…</span></div></div></header>
+<div><h1>Transfer <span class="ver" id="ver"></span></h1><div class="chip"><span class="live"></span><span id="me">Starting…</span></div></div></header>
+<div id="update" class="update glass" hidden><div class="uic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg></div>
+  <div class="txt"><b id="utitle"></b><div class="dim">New features and fixes. Takes a few seconds, then Transfer reopens.</div></div><button class="btn primary" id="ubtn">Update now</button></div>
 <div id="offers"></div>
 <section id="stage" class="stage" hidden>
   <canvas id="fx"></canvas><div class="spark">Live speed</div><button id="stageClose">Close</button>
@@ -360,9 +376,14 @@ function drawFiles(files){const k=files.map(f=>f.name+f.time).join("|");if(k===f
     r.innerHTML=`<span class="ficon" style="--h:${hue(ext(f.name))}">${ext(f.name)}</span><span class="name"></span><span class="meta">${fmt(f.size)} · ${new Date(f.time*1000).toLocaleString([],{dateStyle:"short",timeStyle:"short"})}</span>`;
     r.querySelector(".name").textContent=f.name;r.onclick=()=>api("/api/reveal?name="+encodeURIComponent(f.name),{method:"POST"});el.append(r)}}
 $("#folder").onclick=()=>api("/api/reveal",{method:"POST"});
+$("#ubtn").onclick=async()=>{const b=$("#ubtn");if(b.dataset.manual)return api("/api/release-page",{method:"POST"});
+  b.disabled=true;b.innerHTML='<span class="uspin"></span>Updating…';let r=null;try{r=await api("/api/update",{method:"POST"})}catch(e){}
+  if(r&&r.ok){b.innerHTML='<span class="uspin"></span>Restarting…';$("#update .dim").textContent="Transfer will reopen in a moment."}
+  else{b.disabled=false;b.dataset.manual=1;b.textContent="Download it";$("#update .dim").textContent=(r&&await r.text())||"Couldn't update automatically."}};
 let busy=false;
 async function poll(){try{const s=await(await api("/api/state")).json();
-  myName=s.name;$("#me").textContent=`${s.name} · ${s.ip}`;
+  myName=s.name;$("#me").textContent=`${s.name} · ${s.ip}`;$("#ver").textContent=s.version=="dev"?"":s.version;
+  if(s.update&&$("#update").hidden){$("#update").hidden=false;$("#utitle").textContent=`Transfer ${s.update} is available`}
   drawOffers(s.offers);trackBatches(s.batches);busy=s.offers.length>0||s.batches.some(b=>!b.done&&!b.failed);
   const k=JSON.stringify(s.peers);if(k!==peerKey){peerKey=k;peers=s.peers;if(document.activeElement?.id!="ip"||peers.length)drawPeers()}
   drawFiles(s.files);const names=s.files.map(f=>f.name);
@@ -416,6 +437,89 @@ def bring_to_front():
         w.on_top = False
     except Exception:
         pass  # browser mode, or the window is already gone
+
+
+def ver(tag):
+    try:
+        return tuple(int(x) for x in tag.lstrip("v").split("."))
+    except ValueError:
+        return ()
+
+
+def curl(*args, timeout=30):
+    # curl ships with macOS and Windows 10+ and uses the system's certificates, unlike a bundled Python
+    return subprocess.run(["curl", "-fsSL", *args], capture_output=True, text=True, check=True, timeout=timeout, creationflags=NOWIN).stdout
+
+
+def check_updates():
+    global latest
+    while True:
+        try:
+            tag = curl("-I", "-o", os.devnull, "-w", "%{url_effective}", REPO + "/releases/latest").rsplit("/", 1)[-1]
+            if ver(tag) > ver(VERSION):
+                latest = tag
+        except (OSError, subprocess.SubprocessError):
+            pass  # offline; try again later
+        time.sleep(6 * 3600)
+
+
+def app_paths():
+    # (what the update replaces, where the replaced copy is parked until next start)
+    if sys.platform == "win32":
+        exe = Path(sys.executable)
+        return exe, exe.with_name("Transfer.old.exe")
+    app = Path(sys.executable).parents[2]  # .../Transfer.app/Contents/MacOS/Transfer
+    if app.suffix != ".app":
+        raise RuntimeError("Transfer isn't running as an app")
+    return app, app.with_name("Transfer.old.app")
+
+
+def self_update():
+    # download the latest release, swap it in, start it, and quit this copy
+    cur, old = app_paths()
+    tmp = Path(tempfile.mkdtemp())
+    url = f"{REPO}/releases/download/{latest}/"
+    if sys.platform == "win32":
+        new = tmp / "Transfer.exe"
+        curl("-o", str(new), url + "Transfer.exe", timeout=900)
+    else:
+        curl("-o", str(tmp / "t.zip"), url + "Transfer-mac.zip", timeout=900)
+        subprocess.run(["ditto", "-x", "-k", str(tmp / "t.zip"), str(tmp)], check=True)
+        new = tmp / "Transfer.app"
+    if old.is_dir():
+        shutil.rmtree(old)
+    elif old.exists():
+        old.unlink()
+    cur.rename(old)  # a running app can be renamed (Windows and macOS), just not overwritten
+    try:
+        shutil.move(str(new), str(cur))
+    except Exception:
+        old.rename(cur)  # put the working copy back
+        raise
+    if sys.platform == "win32":
+        env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")  # start fresh, not inside this copy's unpacked files
+        subprocess.Popen([str(cur)], env=env, close_fds=True,
+                         creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
+    else:
+        subprocess.Popen(["open", "-n", str(cur)])
+    threading.Timer(1.5, os._exit, [0]).start()
+
+
+def remove_old_copy():
+    # the copy replaced by the last update may still be closing, so retry for a bit
+    try:
+        old = app_paths()[1]
+    except RuntimeError:
+        return
+    for _ in range(15):
+        try:
+            if old.is_dir():
+                shutil.rmtree(old)
+            elif old.exists():
+                old.unlink()
+            return
+        except OSError:
+            time.sleep(2)
 
 
 def announce():
@@ -491,7 +595,8 @@ class Handler(BaseHTTPRequestHandler):
                 if (b["done"] or b["failed"]) and now - b["seen"] > 20:
                     batches.pop(k, None)
             state = {"name": NAME, "ip": lan_ip(), "peers": sorted(live, key=lambda p: p["name"].lower()),
-                     "files": files, "offers": asks, "batches": list(batches.values())}
+                     "files": files, "offers": asks, "batches": list(batches.values()),
+                     "version": VERSION, "update": latest if FROZEN else None}
             return self.reply(200, json.dumps(state), "application/json")
         self.reply(404)
 
@@ -516,6 +621,17 @@ class Handler(BaseHTTPRequestHandler):
             target = SHARE / name if name else SHARE
             if target.exists():
                 reveal(target)
+            return self.reply(200)
+        if path == "/api/update":
+            if not (FROZEN and latest):
+                return self.reply(400, "No update available")
+            try:
+                self_update()
+            except Exception as e:
+                return self.reply(500, f"Couldn't update automatically ({e}). Click to download it instead.")
+            return self.reply(200, "Restarting")
+        if path == "/api/release-page":
+            webbrowser.open(REPO + "/releases/latest")
             return self.reply(200)
         if path == "/api/add":
             try:
@@ -647,6 +763,9 @@ def main():
     PORT = srv.server_address[1]
     for fn in (srv.serve_forever, announce, listen):
         threading.Thread(target=fn, daemon=True).start()
+    if FROZEN and ver(VERSION):  # only release builds update themselves
+        for fn in (check_updates, remove_old_copy):
+            threading.Thread(target=fn, daemon=True).start()
     url = f"http://127.0.0.1:{PORT}/"
     try:
         import webview

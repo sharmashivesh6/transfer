@@ -1,5 +1,6 @@
 name: build
 
+# every push builds; pushing a tag like v1.2 also publishes it as a release (which the apps update to)
 on:
   push:
   workflow_dispatch:
@@ -16,11 +17,16 @@ jobs:
             artifact: Transfer-mac
             flags: "" # Transfer.app bundle
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
+      - if: startsWith(github.ref, 'refs/tags/v')
+        run: sed -i.bak 's/^VERSION = "dev"/VERSION = "${{ github.ref_name }}"/' transfer.py && grep -q '^VERSION = "${{ github.ref_name }}"' transfer.py
       - run: pip install pyinstaller pywebview
       - run: pyinstaller --windowed --name Transfer ${{ matrix.flags }} transfer.py
       # artifact uploads drop the executable bit, so ship the Mac app inside its own zip
@@ -32,3 +38,18 @@ jobs:
           path: |
             dist/*.exe
             dist/*.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+      - run: >
+          gh release create "${{ github.ref_name }}" --title "Transfer ${{ github.ref_name }}" --notes-file .github/release-notes.md
+          Transfer-windows/Transfer.exe Transfer-mac/Transfer-mac.zip
+        env:
+          GH_TOKEN: ${{ github.token }}
