@@ -11,20 +11,24 @@ jobs:
         include:
           - os: windows-latest
             artifact: Transfer-windows
+            flags: --onefile # single Transfer.exe
           - os: macos-latest # Apple Silicon
             artifact: Transfer-mac
+            flags: "" # Transfer.app bundle
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
-      - run: pip install pyinstaller
-      - run: pyinstaller --onefile --name Transfer transfer.py
-      # artifact uploads drop the executable bit, so ship the Mac binary inside its own zip
+      - run: pip install pyinstaller pywebview
+      - run: pyinstaller --windowed --name Transfer ${{ matrix.flags }} transfer.py
+      # artifact uploads drop the executable bit, so ship the Mac app inside its own zip
       - if: runner.os == 'macOS'
-        run: cd dist && zip -m Transfer-mac.zip Transfer
+        run: cd dist && ditto -c -k --keepParent Transfer.app Transfer-mac.zip
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
-          path: dist/
+          path: |
+            dist/*.exe
+            dist/*.zip
