@@ -475,9 +475,22 @@ def app_paths():
     return app, app.with_name("Transfer.old.app")
 
 
+def update_target(cur):
+    # macOS runs an app opened straight from a browser download from a hidden read-only copy
+    # ("App Translocation"); install the update into Applications instead
+    if sys.platform == "darwin" and ("/AppTranslocation/" in str(cur) or not os.access(cur.parent, os.W_OK)):
+        apps = Path("/Applications")
+        return (apps if os.access(apps, os.W_OK) else Path.home() / "Applications") / "Transfer.app"
+    return cur
+
+
 def self_update():
     # download the latest release, swap it in, start it, and quit this copy
     cur, old = app_paths()
+    if sys.platform == "darwin":
+        cur = update_target(cur)
+        old = cur.with_name("Transfer.old.app")
+        cur.parent.mkdir(exist_ok=True)
     tmp = Path(tempfile.mkdtemp())
     url = f"{REPO}/releases/download/{latest}/"
     if sys.platform == "win32":
@@ -491,11 +504,14 @@ def self_update():
         shutil.rmtree(old)
     elif old.exists():
         old.unlink()
-    cur.rename(old)  # a running app can be renamed (Windows and macOS), just not overwritten
+    had = cur.exists()
+    if had:
+        cur.rename(old)  # a running app can be renamed (Windows and macOS), just not overwritten
     try:
         shutil.move(str(new), str(cur))
     except Exception:
-        old.rename(cur)  # put the working copy back
+        if had:
+            old.rename(cur)  # put the working copy back
         raise
     if sys.platform == "win32":
         env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")  # start fresh, not inside this copy's unpacked files
@@ -628,8 +644,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(400, "No update available")
             try:
                 self_update()
-            except Exception as e:
-                return self.reply(500, f"Couldn't update automatically ({e}). Click to download it instead.")
+            except Exception:
+                return self.reply(500, "Couldn't update automatically. Click Download it to get the new version.")
             return self.reply(200, "Restarting")
         if path == "/api/release-page":
             webbrowser.open(REPO + "/releases/latest")
