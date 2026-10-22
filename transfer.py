@@ -15,6 +15,9 @@ ME = uuid.uuid4().hex
 NAME = socket.gethostname().removesuffix(".local")
 peers = {}  # id -> {"name", "ip", "port", "seen"}
 incoming = {}  # upload key -> {"name", "from", "size", "got"}, while a file is arriving
+offers = {}  # offer id -> {"from", "files", "event", "ok"}, waiting for Accept/Decline
+allowed = {}  # token -> {"from", "files": [[name, size], ...]}: accepted files not yet received
+ASK_SECS = 120  # how long a send request waits for an answer
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Transfer</title><style>
@@ -44,9 +47,13 @@ button,.link{font:inherit;border:0;background:none;color:var(--acc);cursor:point
 .ok .bar i{background:var(--ok)}.bad .bar i{background:var(--bad)}.bad .meta{color:var(--bad)}
 #toast{position:fixed;left:50%;bottom:20px;transform:translate(-50%,80px);background:var(--text);color:var(--bg);padding:10px 16px;border-radius:10px;transition:.3s;max-width:80%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #toast.show{transform:translate(-50%,0)}
+.offer{background:var(--card);border:2px solid var(--acc);border-radius:16px;padding:16px 18px;margin-top:20px;display:flex;gap:10px;align-items:center;box-shadow:0 6px 24px rgba(47,107,255,.15)}
+.offer svg{color:var(--acc);flex:none}.offer .txt{flex:1;min-width:0}.offer .txt b{display:block;font-size:15px}.offer .dim{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.btn{padding:9px 18px;border-radius:10px;font-weight:600;background:var(--accbg)}.btn.primary{background:var(--acc);color:#fff}.btn.primary:hover{background:var(--acc);filter:brightness(1.1)}
 </style></head><body>
 <header><div class="logo"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4v13M3 13l4 4 4-4M17 20V7M13 11l4-4 4 4"/></svg></div>
 <div><h1>Transfer</h1><div class="dim" id="me">Starting…</div></div></header>
+<div id="offers"></div>
 <h2>Send to</h2><div id="peers"></div>
 <div id="sendwrap" hidden><h2>Sending</h2><div class="list" id="sending"></div></div>
 <div id="recvwrap" hidden><h2>Receiving</h2><div class="list" id="receiving"></div></div>
@@ -75,16 +82,29 @@ function drawPeers(){const el=$("#peers");
 $("#pick").onchange=e=>{send(target,e.target.files);e.target.value=""};
 addEventListener("dragover",e=>e.preventDefault());
 addEventListener("drop",e=>{e.preventDefault();if(peers.length==1)send(peers[0],e.dataTransfer.files);else if(peers.length)toast("Drop the files onto a computer")});
-function send(p,files){if(!files.length)return;$("#sendwrap").hidden=false;
-  for(const f of files){const r=document.createElement("div");r.className="row";
-    r.innerHTML=`<span class="name"></span><span class="meta">to ${esc(p.name)} · ${fmt(f.size)}</span><span class="bar"><i></i></span>`;
-    r.querySelector(".name").textContent=f.name;$("#sending").prepend(r);
-    const x=new XMLHttpRequest(),bar=r.querySelector("i"),meta=r.querySelector(".meta");
-    x.upload.onprogress=e=>bar.style.width=(e.loaded/e.total*100)+"%";
-    const fail=m=>{r.className="row bad";bar.style.width="100%";meta.textContent=m};
-    x.onload=()=>{if(x.status==200){r.className="row ok";bar.style.width="100%";meta.textContent="Sent to "+p.name}else fail(x.responseText||"Failed")};
-    x.onerror=()=>fail("Couldn't reach "+p.name);
-    x.open("POST",`/api/send?to=${p.id}&name=${encodeURIComponent(f.name)}`);x.setRequestHeader("X-Transfer","1");x.send(f)}}
+const fail=(r,m)=>{r.className="row bad";r.querySelector("i").style.width="100%";r.querySelector(".meta").textContent=m};
+async function send(p,files){files=[...files];if(!files.length)return;$("#sendwrap").hidden=false;
+  const rows=files.map(f=>{const r=document.createElement("div");r.className="row";
+    r.innerHTML=`<span class="name"></span><span class="meta">Waiting for ${esc(p.name)} to accept…</span><span class="bar"><i></i></span>`;
+    r.querySelector(".name").textContent=f.name;$("#sending").prepend(r);return r});
+  let res=null;try{res=await api("/api/offer?to="+p.id,{method:"POST",body:JSON.stringify(files.map(f=>({name:f.name,size:f.size})))})}catch(e){}
+  if(!res||!res.ok){const m=res?await res.text():"Couldn't reach "+p.name;rows.forEach(r=>fail(r,m||"Failed"));return}
+  const {token}=await res.json();rows.forEach(r=>r.querySelector(".meta").textContent="Accepted · queued");
+  for(let i=0;i<files.length;i++)await upload(p,files[i],rows[i],token)}  // one at a time, in order
+function upload(p,f,r,token){return new Promise(done=>{const x=new XMLHttpRequest(),bar=r.querySelector("i"),meta=r.querySelector(".meta");
+  meta.textContent=`to ${p.name} · ${fmt(f.size)}`;
+  x.upload.onprogress=e=>bar.style.width=(e.loaded/e.total*100)+"%";
+  x.onload=()=>{if(x.status==200){r.className="row ok";bar.style.width="100%";meta.textContent="Sent to "+p.name}else fail(r,x.responseText||"Failed");done()};
+  x.onerror=()=>{fail(r,"Couldn't reach "+p.name);done()};
+  x.open("POST",`/api/send?to=${p.id}&token=${token}&name=${encodeURIComponent(f.name)}`);x.setRequestHeader("X-Transfer","1");x.send(f)})}
+let offerKey="";
+function drawOffers(list){const k=list.map(o=>o.id).join();if(k===offerKey)return;offerKey=k;const el=$("#offers");el.innerHTML="";
+  for(const o of list){const d=document.createElement("div");d.className="offer";
+    const more=o.count>o.files.length?` and ${o.count-o.files.length} more`:"";
+    d.innerHTML=`${PC}<div class="txt"><b>${esc(o.from)} wants to send you ${o.count==1?"a file":o.count+" files"} · ${fmt(o.total)}</b>
+      <div class="dim">${o.files.map(esc).join(", ")}${more}</div></div><button class="btn">Decline</button><button class="btn primary">Accept</button>`;
+    const [no,yes]=d.querySelectorAll("button"),decide=ok=>{d.remove();api(`/api/decide?id=${o.id}&ok=${ok?1:0}`,{method:"POST"})};
+    no.onclick=()=>decide(false);yes.onclick=()=>decide(true);el.append(d)}}
 function drawFiles(files){const el=$("#files");
   el.innerHTML=files.length?"":'<div class="row dim">Files other computers send you will appear here.</div>';
   for(const f of files){const r=document.createElement("div");r.className="row";r.title="Show in folder";
@@ -97,7 +117,7 @@ function drawIncoming(list){$("#recvwrap").hidden=!list.length;const el=$("#rece
 $("#folder").onclick=()=>api("/api/reveal",{method:"POST"});
 let busy=false;
 async function poll(){try{const s=await(await api("/api/state")).json();
-  drawIncoming(s.incoming);busy=s.incoming.length>0;
+  drawOffers(s.offers);drawIncoming(s.incoming);busy=s.incoming.length>0;
   $("#me").textContent=`This computer: ${s.name} · ${s.ip}`;
   const k=JSON.stringify(s.peers);if(k!==peerKey){peerKey=k;peers=s.peers;if(!document.activeElement||document.activeElement.id!="ip"||peers.length)drawPeers()}
   const names=s.files.map(f=>f.name);
@@ -141,6 +161,17 @@ def reveal(path):
         subprocess.Popen(["open", "-R", str(path)] if path.is_file() else ["open", str(path)])
     else:
         subprocess.Popen(["xdg-open", str(path if path.is_dir() else path.parent)])
+
+
+def bring_to_front():
+    try:
+        import webview
+        w = webview.windows[0]
+        w.restore()
+        w.on_top = True  # flipping on_top is the portable way to raise a window
+        w.on_top = False
+    except Exception:
+        pass  # browser mode, or the window is already gone
 
 
 def announce():
@@ -205,17 +236,29 @@ class Handler(BaseHTTPRequestHandler):
                      for p in sorted(SHARE.iterdir(), key=lambda p: -p.stat().st_mtime)
                      if p.is_file() and not p.name.startswith(".")]
             live = [{"id": k, "name": v["name"], "ip": v["ip"]} for k, v in list(peers.items()) if now - v["seen"] < 7]
+            asks = [{"id": k, "from": o["from"], "files": [f[0] for f in o["files"][:4]], "count": len(o["files"]),
+                     "total": sum(f[1] for f in o["files"])} for k, o in list(offers.items())]
             state = {"name": NAME, "ip": lan_ip(), "peers": sorted(live, key=lambda p: p["name"].lower()),
-                     "files": files, "incoming": list(incoming.values())}
+                     "files": files, "incoming": list(incoming.values()), "offers": asks}
             return self.reply(200, json.dumps(state), "application/json")
         self.reply(404)
 
     def do_POST(self):
         path, q = self.route()
+        if path == "/offer":
+            return self.receive_offer()
         if not self.local():
             return self.reply(403)
+        if path == "/api/offer":
+            return self.offer_to_peer(peers.get(q.get("to", "")))
+        if path == "/api/decide":
+            o = offers.get(q.get("id", ""))
+            if o:
+                o["ok"] = q.get("ok") == "1"
+                o["event"].set()
+            return self.reply(200)
         if path == "/api/send":
-            return self.send_to_peer(peers.get(q.get("to", "")), safe_name(q.get("name", "")))
+            return self.send_to_peer(peers.get(q.get("to", "")), safe_name(q.get("name", "")), q.get("token", ""))
         if path == "/api/reveal":
             name = safe_name(q.get("name", ""))
             target = SHARE / name if name else SHARE
@@ -231,7 +274,49 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200)
         self.reply(404)
 
-    def send_to_peer(self, peer, name):
+    def receive_offer(self):
+        # another computer asks to send files; hold the request open until the user answers
+        try:
+            body = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 1 << 20)))
+            sender = str(body["from"])[:64]
+            files = [[safe_name(str(f["name"])), max(0, int(f["size"]))] for f in body["files"]][:1000]
+        except (ValueError, KeyError, TypeError):
+            return self.reply(400)
+        files = [f for f in files if f[0]]
+        if not files:
+            return self.reply(400)
+        oid, event = uuid.uuid4().hex, threading.Event()
+        offers[oid] = o = {"from": sender, "files": files, "event": event, "ok": False}
+        bring_to_front()
+        event.wait(ASK_SECS)
+        offers.pop(oid, None)
+        if not o["ok"]:
+            return self.reply(403, f"{NAME} declined" if event.is_set() else f"{NAME} didn't answer")
+        token = uuid.uuid4().hex
+        allowed[token] = {"from": sender, "files": files}
+        self.reply(200, json.dumps({"token": token}), "application/json")
+
+    def offer_to_peer(self, peer):
+        if not peer:
+            return self.reply(400, "That computer is no longer available")
+        try:
+            files = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+        except ValueError:
+            return self.reply(400, "Bad request")
+        conn = http.client.HTTPConnection(peer["ip"], peer["port"], timeout=ASK_SECS + 10)
+        try:
+            conn.request("POST", "/offer", json.dumps({"from": NAME, "files": files}), {"Content-Type": "application/json"})
+            r = conn.getresponse()
+            status, data = r.status, r.read()
+        except OSError:
+            return self.reply(502, f"Couldn't reach {peer['name']}")
+        finally:
+            conn.close()
+        if status == 404:
+            return self.reply(502, f"{peer['name']} needs to update Transfer")
+        self.reply(status, data, "application/json" if status == 200 else "text/plain; charset=utf-8")
+
+    def send_to_peer(self, peer, name, token):
         # the window uploads to us and we stream it on to the peer, so no cross-origin requests are needed
         if not peer or not name:
             return self.reply(400, "That computer is no longer available")
@@ -244,7 +329,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             conn.putrequest("PUT", "/upload/" + urllib.parse.quote(name))
             conn.putheader("Content-Length", str(left))
-            conn.putheader("X-From", urllib.parse.quote(NAME))
+            conn.putheader("X-Token", token)
             conn.endheaders()
             while left:
                 buf = self.rfile.read(min(CHUNK, left))
@@ -260,15 +345,19 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(200 if status == 200 else 502, "ok" if status == 200 else f"{peer['name']} couldn't save the file")
 
     def do_PUT(self):
-        # the only route other computers can use: receive one file
+        # receive one file, only if the user accepted it (see receive_offer)
         path, _ = self.route()
         name = safe_name(path[len("/upload/"):]) if path.startswith("/upload/") else ""
-        if not name:
-            return self.reply(400, "bad filename")
         left = int(self.headers.get("Content-Length", 0))
-        sender = urllib.parse.unquote(self.headers.get("X-From", ""))[:64] or self.client_address[0]
+        grant = allowed.get(self.headers.get("X-Token", ""))
+        try:
+            grant["files"].remove([name, left])  # each accepted file can arrive once
+        except (TypeError, ValueError):
+            return self.reply(403, "Not accepted")
+        if not grant["files"]:
+            allowed.pop(self.headers["X-Token"], None)
         key = uuid.uuid4().hex
-        incoming[key] = info = {"name": name, "from": sender, "size": left, "got": 0}
+        incoming[key] = info = {"name": name, "from": grant["from"], "size": left, "got": 0}
         tmp = SHARE / f".{key}.part"
         try:
             with open(tmp, "wb") as f:
